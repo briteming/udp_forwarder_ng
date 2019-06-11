@@ -39,3 +39,10 @@ without proxy: 0.475ms + 68.578ms = 69.053ms
 
 overhead (OpenVPN+Forwarder): 1.333ms
 
+## Known bug
+
+Every UDP Forwarder, will drop the first client2server packet. (Doesn't matter).
+
+Every UDP Forwarder, will drop 
+
+I assume that every connection has a unique port. search for comment tag `0427` 

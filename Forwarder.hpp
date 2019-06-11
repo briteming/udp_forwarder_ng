@@ -9,12 +9,11 @@
 #include <picosha2.h>
 #include <rlib/sys/sio.hpp>
 #include <sys/epoll.h>
-#include <rlib/stdio.hpp>
 #include <thread>
 #include <Crypto.hpp>
 #include <unordered_map>
 #include "Config.hpp"
-#include "ConnectionTimeoutCtl.hpp"
+#include "Util.hpp"
 
 using std::string;
 using namespace std::literals;
@@ -75,21 +74,7 @@ public:
         // If I see a packet from client, throw it to server.
         // If I see a packet from server, I have to determine which client to throw it.
         // So I have to record the map between client and server, one-to-one.
-        struct clientInfo {
-            sockaddr_storage addr; socklen_t len;
-            bool operator==(const clientInfo &another) const {
-                if(len != another.len) return false;
-                return std::memcmp(&addr, &another.addr, len) == 0;
-            }
-            bool isNull() const {
-                for(auto cter = 0; cter < sizeof(addr); ++cter) {
-                    if(cter[(char *)&addr] != 0)
-                        return false;
-                }
-                return true;
-            }
-        } __attribute__((packed));
-        struct clientInfoHash {std::size_t operator()(const clientInfo &info) const {return *(std::size_t*)&info.addr;}}; // hash basing on port number and part of ip (v4/v6) address.
+
         std::unordered_map<clientInfo, fd_t, clientInfoHash> client2server;
         std::unordered_map<fd_t, clientInfo> server2client;
         std::unordered_map<fd_t, size_t> server2wallTime;
@@ -98,7 +83,7 @@ public:
         auto connForNewClient = [&, this](const clientInfo &info) {
             if(info.isNull()) throw std::runtime_error("Invalid client info");
             auto serverFd = rlib::quick_connect(serverAddr, serverPort, true);
-            rlib::println("creating new connection...");
+            rlog.verbose("creating new connection... {}", serverFd);
             client2server[info] = serverFd; // May overwrite existing element on server timing out.
             server2client.insert(std::make_pair(serverFd, info));
             server2wallTime.insert(std::make_pair(serverFd, getWallTime()));
@@ -109,9 +94,11 @@ public:
             server2client.erase(fd);
             server2wallTime.erase(fd);
             epoll_del_fd(epollFd, fd);
+            close(fd);
         };
 
-        rlib::println("Forwarding server working...");
+        rlog.info("Forwarding server working...");
+        rlog.info("Listening {}:{}, with upstream server {}:{}.", listenAddr, listenPort, serverAddr, serverPort);
 
         // Main loop!
         while(true) {
@@ -124,6 +111,7 @@ public:
                 const auto recvSideIsClientSide = server2client.find(recvFd) == server2client.end(); // is not server
                 const auto &recvSideKey = recvSideIsClientSide ? lKey : rKey;
                 const auto &sendSideKey = recvSideIsClientSide ? rKey : lKey;
+                rlog.debug("woke up fd {}, isCLient={}", recvFd, recvSideIsClientSide);
 
                 try {
                     size_t size;
@@ -169,35 +157,45 @@ public:
                         if(*(uint64_t*)bufferStr.data() == 0) {
                             if(recvSideIsClientSide) {
                                 // ctl msg from client. (conn change req)
-                                if(bufferStr.size() < sizeof(uint64_t) + 2*sizeof(clientInfo))
+                                uint16_t previous_port, new_port;
+                                if(bufferStr.size() < sizeof(uint64_t) + 2*sizeof(previous_port))
                                     throw std::runtime_error("ctl msg from client too short.");
-                                clientInfo previous, newOne;
-                                std::memcpy(&previous, bufferStr.data()+sizeof(uint64_t), sizeof(clientInfo));
-                                std::memcpy(&newOne, bufferStr.data()+sizeof(uint64_t)+sizeof(clientInfo), sizeof(clientInfo));
-                                previous.len = be32toh(previous.len); newOne.len = be32toh(newOne.len);
+                                std::memcpy(&previous_port, bufferStr.data()+sizeof(uint64_t), sizeof(previous_port));
+                                std::memcpy(&new_port, bufferStr.data()+sizeof(uint64_t)+sizeof(previous_port), sizeof(previous_port));
+                                previous_port = be16toh(previous_port);
+                                new_port = be16toh(new_port);
 
-                                auto iter = client2server.find(previous);
+                                // getsockname on UDP ONLY works for the local port. Ignore the addr!
+                                auto iter = std::find_if(client2server.begin(), client2server.end(), [previous_port](const auto &kv){
+                                    // Known bug 0427: If there's two udp client with different addr and same port. it booms.
+                                    return kv.first.getPortNum() == previous_port;
+                                });
                                 if(iter == client2server.end())
                                     throw std::runtime_error("ctl msg from client: change conn: prev conn not exist.");
-                                auto serverFd = iter->second;
-                                server2client[serverFd] = newOne;
-                                client2server[newOne] = serverFd;
 
-                                // send ACK to client(recvFd)
+                                auto clientSideInfoBackup = clientSideInfo;
+                                clientSideInfo.setPortNum(new_port);
+                                auto serverFd = iter->second;
+                                rlog.debug("Client requested to change conn:", previous_port, new_port);
+                                server2client[serverFd].setPortNum(new_port);
+                                client2server[clientSideInfo] = serverFd; // Old record is not erased now.
+
+                                // send ACK to client(recvFd). Should use previous port.
+                                //   The client will see the ACK from OLD connection and erase it.
                                 string ackStr (sizeof(uint64_t), '\0');
-                                auto ret = sendto(recvFd, ackStr.data(), ackStr.size(), 0, (sockaddr*)&previous.addr, previous.len);
+                                auto ret = sendto(recvFd, ackStr.data(), ackStr.size(), 0, (sockaddr*)&clientSideInfoBackup.addr, clientSideInfoBackup.len);
                                 if(ret == -1)
                                     throw std::runtime_error("Failed to send CONN CHANGE ACK");
 
                                 // remove the ctl prefix
-                                bufferStr = bufferStr.substr(sizeof(uint64_t) + 2*sizeof(clientInfo));
+                                bufferStr = bufferStr.substr(sizeof(uint64_t) + 2*sizeof(previous_port));
                             }
                             else {
-                                // ctl msg from server (conn change ack)
+                                // ACK ctl msg from server (conn change ack)
                                 if(bufferStr.size() != sizeof(uint64_t))
                                     throw std::runtime_error("wrong ack ctl from server");
-                                server2client.erase(recvFd);
-                                server2wallTime.erase(recvFd);
+                                rlog.verbose("REMOVEING FD", recvFd);
+                                eraseServerConn(recvFd);
                                 continue; // nothing todo with bare ACK.
                             }
                         }
@@ -209,16 +207,19 @@ public:
 
                     auto prepareConnChangeReq = [&](fd_t prevFd, fd_t newFd) {
                         clientInfo previous, newOne;
+                        newOne.len = previous.len = sizeof(previous.addr);
                         auto ret = getsockname(prevFd, (sockaddr*)&previous.addr, &previous.len) +
                                 getsockname(newFd, (sockaddr*)&newOne.addr, &newOne.len);
                         if(ret != 0)
                             throw std::runtime_error("getsockname failed.");
-                        previous.len = htobe32(previous.len); newOne.len = htobe32(newOne.len);
+                        auto previous_port = htobe16(previous.getPortNum()),
+                            new_port = htobe16(newOne.getPortNum());
+                        rlog.debug("COnnChangeReq (port num in BIG ENDIAN):", previous_port, new_port);
 
                         // Add control header.
-                        bufferStr = string(sizeof(uint64_t) + sizeof(clientInfo)*2, '\0') + bufferStr;
-                        std::memcpy((char*)bufferStr.data()+sizeof(uint64_t), &previous, sizeof(clientInfo));
-                        std::memcpy((char*)bufferStr.data()+sizeof(uint64_t)+sizeof(clientInfo), &newOne, sizeof(clientInfo));
+                        bufferStr = string(sizeof(uint64_t) + sizeof(previous_port)*2, '\0') + bufferStr;
+                        std::memcpy((char*)bufferStr.data()+sizeof(uint64_t), &previous_port, sizeof(previous_port));
+                        std::memcpy((char*)bufferStr.data()+sizeof(uint64_t)+sizeof(previous_port), &new_port, sizeof(new_port));
                     };
 
                     if(recvSideIsClientSide && !sendSideKey.empty()) {
@@ -232,23 +233,25 @@ public:
                         //   If the message is ACK control message, remove the old entry in server2client.
                         //   Otherwise, resend the bare control header in previous step 2.
                         if(server2wallTime.at(anotherFd) < getWallTime()) {
-                            // This connection timed out. TODO: Check if creating new connection is slow.
+                            // This connection timed out.
+                            rlog.verbose("A Connection timed out, creating new conn...");
                             auto newConnFd = connForNewClient(clientSideInfo);
                             prepareConnChangeReq(anotherFd, newConnFd);
-                       }
+                        }
                     }
 
                     if(!recvSideIsClientSide) {
-                        // server to client: check if the server missed my req.
+                        // server to client: I said to change conn but server still using old conn.
+                        //   Maybe my req lost. resend.
                         auto clientOwnerFd = client2server.at(server2client.at(recvFd));
                         if(clientOwnerFd != recvFd) {
                             // Client2server already modified, but not receiving ACK.
-                            // resend.
                             prepareConnChangeReq(recvFd, clientOwnerFd);
                         }
                     }
 
                     // Send /////////////////////////////////////////////////////////////////////////////////////
+                    rlog.debug("sending on fd", anotherFd);
                     if(recvSideIsClientSide) {
                         // Client to Server packet.
                         size = send(anotherFd, bufferStr.data(), bufferStr.size(), 0);
@@ -258,15 +261,15 @@ public:
                         size = sendto(anotherFd, bufferStr.data(), bufferStr.size(), 0, sendtoAddr, sendtoAddrLen);
                     }
                     if(size == -1) {
-                        throw std::runtime_error("ERR: sendto returns -1. "s + strerror(errno));
+                        throw std::runtime_error("sendto returns -1. "s + strerror(errno));
                     }
                     if(size != bufferStr.size()) {
-                        rlib::println("WARN: sendto not sent all data.");
+                        rlog.warning("sendto not sent all data.");
                     }
                     // Done /////////////////////////////////////////////////////////////////////////////////////
                 }
                 catch(std::exception &e) {
-                    rlib::println(e.what());
+                    rlog.error(e.what());
                 }
             }
         }
