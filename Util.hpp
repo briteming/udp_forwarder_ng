@@ -60,8 +60,6 @@ struct clientInfo {
         return do_compare(another, false);
     }
     bool do_compare(const clientInfo &another, bool need_same_addr = true) const {
-        // Warning: I'm passing clientInfo directly on network while sending ctl msg!
-        //   There maybe port number endian problem or sin_family number endian problem.
         const auto *me = (const sockaddr_in*)&this->addr;
         const auto *an = (const sockaddr_in*)&another.addr;
 
