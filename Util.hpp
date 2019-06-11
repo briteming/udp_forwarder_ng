@@ -114,7 +114,7 @@ struct clientInfo {
         else
             throw std::runtime_error("Invalid client info: sin_family is not AF_INET or AF_INET6: got " + std::to_string(me->sin_family));
     }
-} __attribute__((aligned(4),packed));
+};
 struct clientInfoHash {std::size_t operator()(const clientInfo &info) const {return *(std::size_t*)&info.addr;}}; // hash basing on port number and part of ip (v4/v6) address.
 
 //// Change connection to encrypted server in every 1 minute to avoid GFW deep-packet-inspect.
