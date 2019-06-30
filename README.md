@@ -6,6 +6,10 @@ model. The packet can be easily decrypted if attacker checks the source code.
 This tool is usually used with OpenVPN, to avoid being `deep-learned` by the GFW. OpenVPN already encrypted the packets,
 so I needn't do it again.
 
+## NOTE
+
+DO NOT USE MASTER BRANCH. It's still under debugging. (the connection migration is not stable)
+
 ## Design
 
 ![explain.png](https://raw.githubusercontent.com/recolic/udp_forwarder_ng/master/res/explain.png)
